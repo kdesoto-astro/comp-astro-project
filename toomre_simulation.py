@@ -1,8 +1,13 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import cv2
+#from joblib import Parallel, delayed
+#import multiprocessing
 
-G = 4493.5032
-    
+G = 4492.481912367
+TIME_RES = 1e-3
+
 def butcher_a_values():
     return np.array([[0., 0., 0., 0., 0., 0., 0.], \
             [0.2, 0., 0., 0., 0., 0., 0.], \
@@ -74,20 +79,26 @@ class GalaxyCenter:
         self.vx = vx
         self.vy = vy
         self.t = t_start
-        self.dt = 1e-1
+        self.dt = TIME_RES
     
     
-class OuterParticle:
+class OuterSet:
     """
     Object to store each particle. Assumed to be massless.
     """
-    def __init__(self, x, y, vx, vy):
-        self.x = x
-        self.y = y
-        self.vx = vx
-        self.vy = vy
-        self.dt = 1e-1
-        self.t = -10. # in units of 1e8 years
+    def __init__(self, t_start):
+        self.x = np.array([])
+        self.y = np.array([])
+        self.vx = np.array([])
+        self.vy = np.array([])
+        self.dt = TIME_RES
+        self.t = t_start
+    
+    def append(self, x, y, vx, vy):
+        self.x = np.append(self.x, x)
+        self.y = np.append(self.y, y)
+        self.vx = np.append(self.vx, vx)
+        self.vy = np.append(self.vy, vy)
     
     
 class ToomreSim:
@@ -113,14 +124,14 @@ class ToomreSim:
         
         # initialize each galaxy parabolic trajectory
         reduced_mass = m1*m2/(m1+m2)
-        R_min = [R_min*reduced_mass / m1, R_min*reduced_mass / m2]
+        R_min_arr = [R_min*reduced_mass / m1, R_min*reduced_mass / m2]
         self.rmin = R_min
         for g_idx in [0,1]:
             #print(R_min[g_idx])
             k = G * reduced_mass
-            true_anomaly0 = parabolic_true_anomaly(R_min[g_idx], reduced_mass, t_start)
+            true_anomaly0 = parabolic_true_anomaly(R_min_arr[g_idx], reduced_mass, t_start)
             #print("true anomaly", true_anomaly0)
-            r = 2. * R_min[g_idx] / (1. + np.cos(true_anomaly0))
+            r = 2. * R_min_arr[g_idx] / (1. + np.cos(true_anomaly0))
             v = np.sqrt(2.*k/r)
             #print(180. * (np.pi - true_anomaly0) / np.pi)
             x = r*np.cos(np.pi - true_anomaly0) 
@@ -132,29 +143,58 @@ class ToomreSim:
             #print("v", vx, vy)
             
             if g_idx == 0:
-                self.g1 = GalaxyCenter(m1, R_min[g_idx], x, y, vx, vy, t_start)
+                self.g1 = GalaxyCenter(m1, R_min_arr[g_idx], x, -y, vx, -vy, t_start)
             else:
-                self.g2 = GalaxyCenter(m2, R_min[g_idx], -x, -y, -vx, -vy, t_start)
+                self.g2 = GalaxyCenter(m2, R_min_arr[g_idx], -x, y, -vx, vy, t_start)
         
-        """
+        self.particles = OuterSet(t_start)
         for disc_r_frac in radius_to_particle_fraction:
+            
             # initialize particles for each ring in disk
             R = disc_r_frac * R_min
-            num_particles = np.round(self.N * radius_to_particle_fraction[disc_r_frac])
-            dtheta = 2.*np.pi / num_particles
-            theta = 0.
-            v_kepler =  2.*G*m1 / R
+            num_particles = int(np.round(self.N * radius_to_particle_fraction[disc_r_frac]))
+            v_kepler =  np.sqrt(G * m1 / R)
+            
             # evenly distribute particles in that ring
-            for n in num_particles:
-                theta += dtheta
-                x = R * np.cos(theta)
-                y = R * np.sin(theta)
-                vy = -1. * v_kepler * np.cos(theta)
-                vx = v_kepler * np.sin(theta)
-                self.particles.append(OuterParticle(x, y, vx, vy))
-        """
+            theta = np.linspace(0., 2.*np.pi, num=num_particles+1)[:-1]
+            x = R * np.cos(theta) + self.g1.x
+            y = R * np.sin(theta) + self.g1.y
+            if retrograde:
+                vy = 1. * v_kepler * np.cos(theta) + self.g1.vy
+                vx = -1. * v_kepler * np.sin(theta) + self.g1.vx
+            else:
+                vy = -1. * v_kepler * np.cos(theta) + self.g1.vy
+                vx = 1. * v_kepler * np.sin(theta) + self.g1.vx
+            self.particles.append(x, y, vx, vy)
+    
+    
+    def leapfrog_kick(self, p):
         
+        r_sq1 = (p.x - self.g1.x)**2 + (p.y - self.g1.y)**2
+        r_sq2 = (p.x - self.g2.x)**2 + (p.y - self.g2.y)**2
+        ax =  -G * self.g1.m * (p.x - self.g1.x) / r_sq1**(3/2.) \
+            - G * self.g2.m * (p.x - self.g2.x) / r_sq2**(3/2.)
+        ay =  -G * self.g1.m * (p.y - self.g1.y) / r_sq1**(3/2.) \
+            - G * self.g2.m * (p.y - self.g2.y) / r_sq2**(3/2.)
+        
+        #print(self.g1.x, p.x, ax)
+        p.vx += ax * p.dt / 2.
+        p.vy += ay * p.dt / 2.
+
     def step_leapfrog(self):
+        
+        #kick step
+        self.leapfrog_kick(self.particles)
+
+        # drift step
+        self.particles.x += self.particles.vx * self.particles.dt
+        self.particles.y += self.particles.vy * self.particles.dt
+
+        # kick step
+        self.leapfrog_kick(self.particles)
+
+        self.particles.t += self.particles.dt
+        
         reduced_mass = self.g1.m*self.g2.m / (self.g1.m + self.g2.m)
         for g in (self.g1, self.g2):
             r_sq = g.x**2 + g.y**2 
@@ -173,20 +213,30 @@ class ToomreSim:
             g.vx += ax * g.dt / 2.
             g.vy += ay * g.dt / 2.
             g.t += g.dt
-            
-            #print( - G * reduced_mass / np.sqrt(r_sq) + 0.5 * (g.vx**2 + g.vy**2)) # total energy
-            
-        plt.scatter([self.g1.x, self.g2.x], [self.g1.y, self.g2.y])
+        #plt.scatter([self.g1.x, self.g2.x], [self.g1.y, self.g2.y], s=1, c="k")
 
         
-    def evolve(self, t_final):
+    def evolve(self, t_final, img_num):
         while self.g1.t < t_final:
+            if np.round(self.g1.t) == self.g1.t:
+                print(self.g1.t)
             self.step_leapfrog()
-        print(self.g1.x, self.g1.y, self.g1.vx, self.g1.vy)
+        #print(self.g1.x, self.g1.y, self.g1.vx, self.g1.vy)
+        """
         plt.xlim(-50., 50.)
         plt.ylim(-100., 100.)
         plt.savefig("figs/time_%.03e.png" % self.g1.t)
         #plt.ylim(-50., 50.)
+        plt.close()
+        """
+        
+        # plot particle positions
+        plt.scatter(self.particles.x, self.particles.y, s=10, facecolors='none', edgecolors='k')
+        plt.scatter([self.g1.x, self.g2.x], [self.g1.y, self.g2.y], s=20, c="k")
+        plt.title("t = %01f" % self.g1.t)
+        plt.xlim(-50., 100.)
+        plt.ylim(-50., 100.)
+        plt.savefig("figs/direct/toomre_a_%d.png" % img_num)
         plt.close()
     
     def fourth_order_approx(self, particle, k_x, k_y, k_vx, k_vy):
@@ -212,8 +262,30 @@ class ToomreSim:
         
         return new_x, new_y, new_vx, new_vy
 
+
+def make_video_from_images(image_folder, video_name):
     
-ts = ToomreSim(120, 1., 1., True, -10.)
-ts.evolve(10.)
+    images = [img for img in os.listdir(image_folder) if img.endswith(".png")]
+    frame = cv2.imread(os.path.join(image_folder, images[0]))
+    height, width, layers = frame.shape
+
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    video = cv2.VideoWriter(video_name, fourcc, 50, (width,height))
+
+    for image in images:
+        video.write(cv2.imread(os.path.join(image_folder, image)))
+
+    cv2.destroyAllWindows()
+    video.release()
+
+def main():
+    ts = ToomreSim(480, 1., 1., False, -10.)
+    ct = 5000
+    for et in np.linspace(-10., 10., num=500):
+        ct += 1
+        ts.evolve(et, ct)
+    make_video_from_images("figs/direct", "toomre_direct_vid.avi")
+    
+main()
     
     
